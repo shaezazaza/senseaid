@@ -243,9 +243,8 @@ class GestureControl:
         return None
 
 
-def count_fingers(hand_landmarks):
-    """Raised fingers (index to pinky): tip above the middle joint."""
-    lm = hand_landmarks.landmark
+def count_fingers(lm):
+    """lm = list of 21 hand points. Raised fingers (index to pinky): tip above the middle joint."""
     tips, pips = [8, 12, 16, 20], [6, 10, 14, 18]
     return sum(lm[t].y < lm[p].y for t, p in zip(tips, pips))
 
@@ -269,27 +268,141 @@ def classify_roi(model, classes, roi):
     return classes[i], float(probs[i])
 
 
-def load_hands():
-    """Gesture control is optional: if MediaPipe is missing or broken,
-    the app still runs with keyboard controls."""
-    try:
+class PersonDetector:
+    """Face detector (works when you sit in front of a laptop camera)
+    + HOG full-body detector (works for people standing further away).
+    The count is smoothed so it doesn't flicker."""
+
+    def __init__(self, history=6):
+        if not (hasattr(cv2, "CascadeClassifier") and hasattr(cv2, "HOGDescriptor")):
+            raise SystemExit("Person mode needs OpenCV 4: pip install opencv-python==4.10.0.84")
+        self.face = self._load_cascade("haarcascade_frontalface_default.xml")
+        self.profile = self._load_cascade("haarcascade_profileface.xml")
+        self.hog = cv2.HOGDescriptor()
+        self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        self.boxes = []          # last boxes (drawn every frame -> no flicker)
+        self.counts = []         # recent counts for smoothing
+        self.history = history
+
+    @staticmethod
+    def _load_cascade(name):
+        """Looks in models/ first (OpenCV 5 doesn't ship the XML files), then OpenCV's folder."""
+        places = [os.path.join(MODEL_DIR, name)]
+        if hasattr(cv2, "data"):
+            places.append(os.path.join(cv2.data.haarcascades, name))
+        for path in places:
+            if os.path.exists(path):
+                c = cv2.CascadeClassifier(path)
+                if not c.empty():
+                    return c
+        print(f"Face detector file {name} not found - put it in {MODEL_DIR}")
+        return None
+
+    def detect(self, frame):
+        gray = cv2.equalizeHist(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        faces = []
+        if self.face is not None:
+            faces = list(self.face.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6, minSize=(50, 50)))
+        if not faces and self.profile is not None:
+            faces = list(self.profile.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6, minSize=(50, 50)))
+
+        bodies, weights = self.hog.detectMultiScale(frame, winStride=(8, 8), padding=(8, 8), scale=1.05)
+        bodies = [b for b, wt in zip(bodies, np.ravel(weights)) if wt > 0.5]
+
+        # A body that already contains a detected face is the same person
+        people = [tuple(f) for f in faces]
+        for (bx, by, bw, bh) in bodies:
+            has_face = any(bx < fx + fw / 2 < bx + bw and by < fy + fh / 2 < by + bh
+                           for (fx, fy, fw, fh) in faces)
+            if not has_face:
+                people.append((bx, by, bw, bh))
+        self.boxes = people
+
+        self.counts = (self.counts + [len(people)])[-self.history:]
+
+    def stable_count(self):
+        """Most common count over the last few checks (ignores 1-off flickers)."""
+        if len(self.counts) < self.history:
+            return None
+        return max(set(self.counts), key=self.counts.count)
+
+    def draw(self, frame):
+        for (x, y, w, h) in self.boxes:
+            cv2.rectangle(frame, (int(x), int(y)), (int(x + w), int(y + h)), (0, 255, 0), 2)
+            cv2.putText(frame, "Person", (int(x), int(y) - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+
+HAND_MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+                  "hand_landmarker/float16/latest/hand_landmarker.task")
+HAND_MODEL_PATH = os.path.join(MODEL_DIR, "hand_landmarker.task")
+HAND_LINKS = [(0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8), (5, 9), (9, 10),
+              (10, 11), (11, 12), (9, 13), (13, 14), (14, 15), (15, 16), (13, 17), (0, 17),
+              (17, 18), (18, 19), (19, 20)]
+
+
+class HandTracker:
+    """MediaPipe Tasks HandLandmarker (the new API - no protobuf clash with TensorFlow).
+    Downloads the 8 MB hand model into models/ the first time."""
+
+    def __init__(self):
         import mediapipe as mp
-        mp_hands = mp.solutions.hands
-        return mp_hands, mp.solutions.drawing_utils, mp_hands.Hands(
-            max_num_hands=1, min_detection_confidence=0.6)
+        if not os.path.exists(HAND_MODEL_PATH):
+            import urllib.request
+            print("Downloading hand model (one time, ~8 MB)...")
+            urllib.request.urlretrieve(HAND_MODEL_URL, HAND_MODEL_PATH)
+        vision = mp.tasks.vision
+        options = vision.HandLandmarkerOptions(
+            base_options=mp.tasks.BaseOptions(model_asset_path=HAND_MODEL_PATH),
+            running_mode=vision.RunningMode.VIDEO,
+            num_hands=1,
+            min_hand_detection_confidence=0.5,
+            min_hand_presence_confidence=0.5,
+            min_tracking_confidence=0.5)
+        self.mp = mp
+        self.landmarker = vision.HandLandmarker.create_from_options(options)
+        self.t0 = time.time()
+
+    def find(self, frame):
+        """Returns a list of 21 (x, y) pixel points for one hand, or None."""
+        h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=rgb)
+        result = self.landmarker.detect_for_video(image, int((time.time() - self.t0) * 1000))
+        if not result.hand_landmarks:
+            return None
+        return result.hand_landmarks[0]
+
+    @staticmethod
+    def draw(frame, lm):
+        h, w = frame.shape[:2]
+        pts = [(int(p.x * w), int(p.y * h)) for p in lm]
+        for a, b in HAND_LINKS:
+            cv2.line(frame, pts[a], pts[b], (255, 0, 255), 2)
+        for p in pts:
+            cv2.circle(frame, p, 4, (0, 255, 255), -1)
+
+    def close(self):
+        self.landmarker.close()
+
+
+def load_hands():
+    """Gesture control is optional: if MediaPipe fails, the app still runs with the keyboard."""
+    try:
+        return HandTracker()
     except Exception as e:
         print("Gestures OFF (MediaPipe problem):", e)
+        print("Fix: pip install --upgrade mediapipe   (then run again)")
         print("Use the keyboard instead: 1 / 2 / r / q")
-        return None, None, None
+        return None
 
 
 def run():
     currency_model, currency_classes = load_model_and_classes("currency")
 
-    hog = cv2.HOGDescriptor()
-    hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+    people = PersonDetector()
 
-    mp_hands, mp_draw, hands = load_hands()
+    hands = load_hands()
 
     speaker = Speaker()
     stable = StableLabel(hold_seconds=2.0, threshold=0.6)
@@ -305,6 +418,8 @@ def run():
     def switch_mode(new_mode):
         state["mode"] = new_mode
         state["last_people"] = -1
+        people.counts.clear()
+        people.boxes = []
         stable.reset()
         speaker.say(f"{new_mode} mode")
 
@@ -324,14 +439,15 @@ def run():
         fingers = None
         if hands is not None:
             try:
-                result = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                if result.multi_hand_landmarks:
-                    hand = result.multi_hand_landmarks[0]
-                    cx, cy = hand.landmark[9].x * w, hand.landmark[9].y * h   # middle of palm
-                    in_box = x1 < cx < x2 and y1 < cy < y2
+                lm = hands.find(frame)
+                if lm is not None:
+                    cx, cy = lm[9].x * w, lm[9].y * h       # middle of palm
+                    in_box = mode == "currency" and x1 < cx < x2 and y1 < cy < y2
+                    hands.draw(frame, lm)
                     if not in_box:
-                        fingers = count_fingers(hand)
-                        mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
+                        fingers = count_fingers(lm)
+                        cv2.putText(frame, f"Fingers: {fingers}", (w - 170, 40),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
             except Exception as e:
                 print("Gestures OFF (MediaPipe error):", e)
                 print("Use the keyboard instead: 1 / 2 / r / q")
@@ -356,15 +472,17 @@ def run():
             cv2.putText(frame, f"{label} ({conf:.0%})", (20, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-        elif mode == "person" and frame_no % 10 == 0:
-            boxes, _ = hog.detectMultiScale(frame, winStride=(8, 8))
-            for (x, y, bw, bh) in boxes:
-                cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
-            n = len(boxes)
-            if n != state["last_people"]:
-                state["last_people"] = n
-                speaker.say("No one ahead" if n == 0 else
-                            f"{n} {'person' if n == 1 else 'people'} ahead")
+        elif mode == "person":
+            if frame_no % 5 == 0:
+                people.detect(frame)
+                n = people.stable_count()
+                if n is not None and n != state["last_people"]:
+                    state["last_people"] = n
+                    speaker.say("No one ahead" if n == 0 else
+                                f"{n} {'person' if n == 1 else 'people'} ahead")
+            people.draw(frame)
+            cv2.putText(frame, f"People: {max(state['last_people'], 0)}", (20, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
         # ---------- Status bar ----------
         cv2.putText(frame, f"Mode: {mode.upper()}",
